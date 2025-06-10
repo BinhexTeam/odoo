@@ -130,40 +130,7 @@ export class SaleOrderManagementScreen extends ControlButtonsMixin(Component) {
                 }
             }
 
-            const order_partner = this.pos.db.get_partner_by_id(sale_order.partner_id[0]);
-            if (order_partner) {
-                currentPOSOrder.set_partner(order_partner);
-            } else {
-                try {
-                    await this.pos._loadPartners([sale_order.partner_id[0]]);
-                } catch {
-                    const title = _t("Customer loading error");
-                    const body = _t(
-                        "There was a problem in loading the %s customer.",
-                        sale_order.partner_id[1]
-                    );
-                    await this.popup.add(ErrorPopup, { title, body });
-                }
-                currentPOSOrder.set_partner(
-                    this.pos.db.get_partner_by_id(sale_order.partner_id[0])
-                );
-            }
-            const orderFiscalPos = sale_order.fiscal_position_id
-                ? this.pos.fiscal_positions.find(
-                      (position) => position.id === sale_order.fiscal_position_id[0]
-                  )
-                : false;
-            if (orderFiscalPos) {
-                currentPOSOrder.fiscal_position = orderFiscalPos;
-            }
-            const orderPricelist = sale_order.pricelist_id
-                ? this.pos.pricelists.find(
-                      (pricelist) => pricelist.id === sale_order.pricelist_id[0]
-                  )
-                : false;
-            if (orderPricelist) {
-                currentPOSOrder.set_pricelist(orderPricelist);
-            }
+            await this._setOrderPartnerAndPricelist(currentPOSOrder, sale_order);
 
             if (selectedOption == "settle") {
                 // settle the order
@@ -197,66 +164,32 @@ export class SaleOrderManagementScreen extends ControlButtonsMixin(Component) {
                  */
                 let useLoadedLots;
 
-                for (var i = 0; i < lines.length; i++) {
-                    const line = lines[i];
+                for (const line of lines) {
                     if (!this.pos.db.get_product_by_id(line.product_id[0])) {
                         continue;
                     }
 
-                    const line_values = {
-                        pos: this.pos,
-                        order: this.pos.get_order(),
-                        product: this.pos.db.get_product_by_id(line.product_id[0]),
-                        description: line.name,
-                        price: line.price_unit,
-                        tax_ids: orderFiscalPos ? undefined : line.tax_id,
-                        price_manually_set: false,
-                        price_type: "automatic",
-                        sale_order_origin_id: clickedOrder,
-                        sale_order_line_id: line,
-                        customer_note: line.customer_note,
-                    };
+                    const line_values = this._prepareOrderLineValues(line, sale_order, clickedOrder);
                     const new_line = new Orderline({ env: this.env }, line_values);
+                    useLoadedLots = await this._handleLotProcessing(new_line, line, useLoadedLots);
 
-                    if (
-                        new_line.get_product().tracking !== "none" &&
-                        (this.pos.picking_type.use_create_lots ||
-                            this.pos.picking_type.use_existing_lots) &&
-                        line.lot_names.length > 0
-                    ) {
-                        // Ask once when `useLoadedLots` is undefined, then reuse it's value on the succeeding lines.
-                        const { confirmed } =
-                            useLoadedLots === undefined
-                                ? await this.popup.add(ConfirmPopup, {
-                                      title: _t("SN/Lots Loading"),
-                                      body: _t(
-                                          "Do you want to load the SN/Lots linked to the Sales Order?"
-                                      ),
-                                      confirmText: _t("Yes"),
-                                      cancelText: _t("No"),
-                                  })
-                                : { confirmed: useLoadedLots };
-                        useLoadedLots = confirmed;
-                        if (useLoadedLots) {
-                            new_line.setPackLotLines({
-                                modifiedPackLotLines: [],
-                                newPackLotLines: (line.lot_names || []).map((name) => ({
-                                    lot_name: name,
-                                })),
-                            });
-                        }
-                    }
                     new_line.setQuantityFromSOL(line);
                     new_line.set_unit_price(line.price_unit);
                     new_line.set_discount(line.discount);
-                    const product = this.pos.db.get_product_by_id(line.product_id[0]);
+
+                    const product = new_line.get_product(); // Use new_line.get_product()
                     const product_unit = product.get_unit();
                     if (product_unit && !product.get_unit().is_pos_groupable) {
                         let remaining_quantity = new_line.quantity;
                         while (!floatIsZero(remaining_quantity, 6)) {
-                            const splitted_line = new Orderline({ env: this.env }, line_values);
+                            // Create new line_values for the split line to avoid issues with references
+                            const split_line_values = this._prepareOrderLineValues(line, sale_order, clickedOrder);
+                            const splitted_line = new Orderline({ env: this.env }, split_line_values);
                             splitted_line.set_quantity(Math.min(remaining_quantity, 1.0), true);
+                            // carry over the discount from the original line to the split lines
                             splitted_line.set_discount(line.discount);
+                            // carry over lot information if applicable, though usually not for non-groupable
+                            await this._handleLotProcessing(splitted_line, line, useLoadedLots);
                             this.pos.get_order().add_orderline(splitted_line);
                             remaining_quantity -= splitted_line.quantity;
                         }
@@ -357,6 +290,143 @@ export class SaleOrderManagementScreen extends ControlButtonsMixin(Component) {
         }
     }
 
+    /**
+     * Sets the partner, fiscal position, and pricelist on the current POS order
+     * based on the provided sale order details.
+     * This method is designed to be overridden by other modules to customize its behavior.
+     *
+     * @param {object} currentPOSOrder The current POS order instance.
+     * @param {object} saleOrder The full sale order details from which to derive partner, fiscal position, and pricelist.
+     */
+    async _setOrderPartnerAndPricelist(currentPOSOrder, saleOrder) {
+        const partnerId = saleOrder.partner_id[0];
+        let partner = this.pos.db.get_partner_by_id(partnerId);
+        if (!partner) {
+            try {
+                await this.pos._loadPartners([partnerId]);
+                partner = this.pos.db.get_partner_by_id(partnerId);
+            } catch {
+                const title = _t("Customer loading error");
+                const body = sprintf(
+                    _t("There was a problem in loading the %s customer."),
+                    saleOrder.partner_id[1]
+                );
+                await this.popup.add(ErrorPopup, { title, body });
+            }
+        }
+        currentPOSOrder.set_partner(partner);
+
+        const orderFiscalPos = saleOrder.fiscal_position_id
+            ? this.pos.fiscal_positions.find(
+                  (position) => position.id === saleOrder.fiscal_position_id[0]
+              )
+            : false;
+        if (orderFiscalPos) {
+            currentPOSOrder.fiscal_position = orderFiscalPos;
+        }
+
+        const orderPricelist = saleOrder.pricelist_id
+            ? this.pos.pricelists.find(
+                  (pricelist) => pricelist.id === saleOrder.pricelist_id[0]
+              )
+            : false;
+        if (orderPricelist) {
+            currentPOSOrder.set_pricelist(orderPricelist);
+        }
+    }
+
+    /**
+     * Prepares the values for creating a new POS order line from a sale order line.
+     * This method is designed to be overridden by other modules to customize its behavior.
+     *
+     * @param {object} saleOrderLine The sale order line.
+     * @param {object} saleOrder The sale order.
+     * @param {object} clickedOrder The sale order object that was clicked in the UI, used for origin ID.
+     * @returns {object} The values for creating a new POS order line.
+     */
+    _prepareOrderLineValues(saleOrderLine, saleOrder, clickedOrder) {
+        const orderFiscalPos = saleOrder.fiscal_position_id
+            ? this.pos.fiscal_positions.find(
+                  (position) => position.id === saleOrder.fiscal_position_id[0]
+              )
+            : false;
+        return {
+            pos: this.pos,
+            order: this.pos.get_order(),
+            product: this.pos.db.get_product_by_id(saleOrderLine.product_id[0]),
+            description: saleOrderLine.name,
+            price: saleOrderLine.price_unit,
+            tax_ids: orderFiscalPos ? undefined : saleOrderLine.tax_id,
+            price_manually_set: false,
+            price_type: "automatic",
+            sale_order_origin_id: clickedOrder,
+            sale_order_line_id: saleOrderLine,
+            customer_note: saleOrderLine.customer_note,
+        };
+    }
+
+    /**
+     * Handles the processing of lot numbers for a POS order line created from a sale order line.
+     * It checks if the product requires tracking and if lot names are available from the sale order.
+     * If so, it prompts the user (once per sales order) if they want to use these lot names.
+     * This method is designed to be overridden by other modules to customize its behavior.
+     *
+     * @param {Orderline} posOrderLine The POS order line instance.
+     * @param {object} saleOrderLine The raw sale order line data.
+     * @param {boolean|undefined} useLoadedLots Current user preference for using loaded lots.
+     * @returns {Promise<boolean|undefined>} The updated user preference for using loaded lots.
+     */
+    async _handleLotProcessing(posOrderLine, saleOrderLine, useLoadedLots) {
+        if (
+            posOrderLine.get_product().tracking !== "none" &&
+            (this.pos.picking_type.use_create_lots || this.pos.picking_type.use_existing_lots) &&
+            saleOrderLine.lot_names && saleOrderLine.lot_names.length > 0
+        ) {
+            let confirmed = useLoadedLots;
+            if (useLoadedLots === undefined) {
+                const { confirmed: userConfirmation } = await this.popup.add(ConfirmPopup, {
+                    title: _t("SN/Lots Loading"),
+                    body: _t("Do you want to load the SN/Lots linked to the Sales Order?"),
+                    confirmText: _t("Yes"),
+                    cancelText: _t("No"),
+                });
+                confirmed = userConfirmation;
+            }
+
+            if (confirmed) {
+                posOrderLine.setPackLotLines({
+                    modifiedPackLotLines: [],
+                    newPackLotLines: (saleOrderLine.lot_names || []).map(name => ({ lot_name: name })),
+                });
+            }
+            return confirmed;
+        }
+        return useLoadedLots;
+    }
+
+    /**
+     * Prepares the values for creating a new POS down payment order line.
+     * This method is designed to be overridden by other modules to customize its behavior.
+     *
+     * @param {object} downPaymentLine An object containing price, tax, and detail information for the down payment.
+     * @param {object} clickedOrder The sale order object that was clicked in the UI, used for origin ID.
+     * @param {object} downPaymentProduct The product master to be used for the down payment line.
+     * @returns {object} The values for creating a new POS order line for the down payment.
+     */
+    _prepareDownPaymentLineValues(downPaymentLine, clickedOrder, downPaymentProduct) {
+        return {
+            pos: this.pos,
+            order: this.pos.get_order(),
+            product: downPaymentProduct,
+            price: downPaymentLine.price,
+            quantity: 1,
+            price_type: "automatic",
+            sale_order_origin_id: clickedOrder,
+            down_payment_details: downPaymentLine.tab,
+            tax_ids: downPaymentLine.tax_ids,
+        };
+    }
+
     _createDownpaymentLines(sale_order, total_down_payment, clickedOrder, down_payment_product) {
         //This function will create all the downpaymentlines. We will create one downpayment line per unique tax combination
         const percentage = total_down_payment / sale_order.amount_total;
@@ -445,20 +515,9 @@ export class SaleOrderManagementScreen extends ControlButtonsMixin(Component) {
             }
         }
         for (const down_payment_line of down_payment_line_to_create) {
+            const line_values = this._prepareDownPaymentLineValues(down_payment_line, clickedOrder, down_payment_product);
             this.pos.get_order().add_orderline(
-                new Orderline(
-                    { env: this.env },
-                    {
-                        pos: this.pos,
-                        order: this.pos.get_order(),
-                        product: down_payment_product,
-                        price: down_payment_line.price,
-                        price_type: "automatic",
-                        sale_order_origin_id: clickedOrder,
-                        down_payment_details: down_payment_line.tab,
-                        tax_ids: down_payment_line.tax_ids,
-                    }
-                )
+                new Orderline({ env: this.env }, line_values)
             );
         }
     }
